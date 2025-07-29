@@ -15,12 +15,13 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.feature_selection import SelectFromModel
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score
 from scipy.stats import pearsonr
+from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, precision_recall_curve, auc, f1_score
 
 
 import pickle
 
+num_repeats = 100
 
 dogsClass = "0"
 catsClass = "1"
@@ -81,12 +82,52 @@ def run_ml_pipeline(features, labels):
 def evaluate_model(model, test_features, test_labels):
     fsel, clf = model
     selected_features = fsel.transform(test_features)
-    preds = clf.predict_proba(selected_features)[:, 1]
-    return roc_auc_score(test_labels, preds)
+    probas = clf.predict_proba(selected_features)[:, 1]
+
+    auc_score = roc_auc_score(test_labels, probas)
+
+    fpr, tpr, thresholds = roc_curve(test_labels, probas)
+    youden_index = tpr - fpr
+    optimal_idx = youden_index.argmax()
+    optimal_threshold = thresholds[optimal_idx]
+
+    preds_optimal = (probas >= optimal_threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(test_labels, preds_optimal).ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+    f1 = f1_score(test_labels, preds_optimal)
+
+    precision, recall, _ = precision_recall_curve(test_labels, probas)
+    auprc = auc(recall, precision)
+
+    return auc_score, sensitivity, specificity, f1, auprc
 
 
 
-def run_single_repeat(r, method, root, ccc_threshold, num_features):
+def create_table ():
+    tbls = []
+    for dataset in ["CRLM", "Desmoid", "GIST", "Lipo"]:
+        dataset_a, dataset_b = get_dataset_pairs(f"{root}/{dataset}")
+        dataset_a_labels = [0 if f"/{dogsClass}/" in g else 1 for g in dataset_a]
+        _, (minorcl, majorcl) = np.unique(dataset_a_labels, return_counts = True)
+        if minorcl > majorcl:
+            minorcl, majorcl = majorcl, minorcl
+        bal = majorcl/minorcl
+        tbls.append({"Dataset": dataset,
+                "Modality": "",
+                "Sample Size": len(dataset_a),
+                "Size of minor class": minorcl,
+                "Size of major class": majorcl,
+                "Class-balance": bal,
+                "In-plane resolution": ".",
+                "Slice thickness": "."})
+    tbl = pd.DataFrame(tbls)
+    tbl.to_excel("./results/Table_1_raw.xlsx")
+
+
+
+def run_single_repeat(r, root, ccc_threshold):
     np.random.seed(r)
     random.seed(r)
 
@@ -114,63 +155,66 @@ def run_single_repeat(r, method, root, ccc_threshold, num_features):
     repro_feats = np.abs(ccc_values) >= ccc_threshold
     non_repro_feats = np.abs(ccc_values) < ccc_threshold
 
-    filtered_features_a_repro = features_a[:, repro_feats]
-    filtered_features_b_repro = features_b[:, repro_feats]
-    filtered_features_a_nonrepro = features_a[:, non_repro_feats]
-    filtered_features_b_nonrepro = features_b[:, non_repro_feats]
+    feature_sets = {
+        'Full': features_a,
+        'Repro': features_a[:, repro_feats],
+        'NonRepro': features_a[:, non_repro_feats]
+    }
+    # print (ccc_threshold, feature_sets["Full"].shape[1], feature_sets["Repro"].shape[1], feature_sets["NonRepro"].shape[1], features_b.shape[1])
 
-    full_model_a = run_ml_pipeline(features_a, labels_a)
-    #full_model_b = run_ml_pipeline(features_b, labels_b)
-
-    test_features_a = extract_features(test_a, names_a)[0]
-    test_features_b = extract_features(test_b, names_a)[0]
-
-    auc_full_aa = evaluate_model(full_model_a, test_features_a, test_labels_a)
-
-    restricted_model_repro = run_ml_pipeline(filtered_features_a_repro, labels_a)
-    auc_repro_aa = evaluate_model(restricted_model_repro, test_features_a[:, repro_feats], test_labels_a)
-
-    restricted_model_non_repro = run_ml_pipeline(filtered_features_a_nonrepro, labels_a)
-    auc_nonrepro_aa = evaluate_model(restricted_model_non_repro, test_features_a[:, non_repro_feats], test_labels_a)
-
-    print(".", end='', flush=True)
-
-    return {
-        "Method": method,
-        "CCC-Threshold": ccc_threshold,
-        "Number-Features": num_features,
-        "AUC-Full-A-A": auc_full_aa,
-        "AUC-Repro-A-A": auc_repro_aa,
-        "AUC-NonRepro-A-A": auc_nonrepro_aa,
+    test_features_a, _ = extract_features(test_a, names_a)
+    test_feature_sets = {
+        'Full': test_features_a,
+        'Repro': test_features_a[:, repro_feats],
+        'NonRepro': test_features_a[:, non_repro_feats]
     }
 
+    results = {}
+    for fs_name in ['Full', 'Repro', 'NonRepro']:
+        current_model = run_ml_pipeline(feature_sets[fs_name], labels_a)
+        auc, sens, spec, f1, auprc = evaluate_model(current_model, test_feature_sets[fs_name], test_labels_a)
+
+        # Save to results dictionary with suffix
+        results[f'AUC-{fs_name}-A-A'] = auc
+        results[f'Sensitivity-{fs_name}-A-A'] = sens
+        results[f'Specificity-{fs_name}-A-A'] = spec
+        results[f'AUPRC-{fs_name}-A-A'] = auprc
+        results[f'F1-{fs_name}-A-A'] = f1
+
+    results.update({
+        "CCC-Threshold": ccc_threshold
+    })
+
+    print(".", end='', flush=True)
+    return results
 
 
-def run_experiment(method, root, num_repeats=30, ccc_threshold=0.85, num_features=50):
+
+def run_experiment(root, num_repeats=30, ccc_threshold=0.85):
     results = Parallel(n_jobs=30)(
-        delayed(run_single_repeat)(r, method, root, ccc_threshold, num_features)
+        delayed(run_single_repeat)(r, root, ccc_threshold)
         for r in range(num_repeats)
     )
     return results
 
 
-
-def plot_auc(df, file_path, dataset):
-    tmp_df = df.drop(["Method"], axis=1)
+# df, mm, file_path, dataset = df_radiomics.copy(), k, image_path, dataset
+def plot_metrics(df, mm, file_path, dataset):
+    tmp_df = df.copy()
     grouped = tmp_df.groupby('CCC-Threshold')
     grouped_df = grouped.mean().reset_index().sort_values('CCC-Threshold', ascending=False)
     se_df = grouped.sem().reset_index().sort_values('CCC-Threshold', ascending=False)
 
     # Extract AUC values
-    auc_full_aa = grouped_df["AUC-Full-A-A"]
-    auc_repro_aa = grouped_df["AUC-Repro-A-A"]
-    auc_nonrepro_aa = grouped_df["AUC-NonRepro-A-A"]
+    auc_full_aa = grouped_df[f"{mm}-Full-A-A"]
+    auc_repro_aa = grouped_df[f"{mm}-Repro-A-A"]
+    auc_nonrepro_aa = grouped_df[f"{mm}-NonRepro-A-A"]
 
     # Compute confidence intervals
     z_score = 1.96
-    ci_full_aa = z_score * se_df["AUC-Full-A-A"]
-    ci_repro_aa = z_score * se_df["AUC-Repro-A-A"]
-    ci_nonrepro_aa = z_score * se_df["AUC-NonRepro-A-A"]
+    ci_full_aa = z_score * se_df[f"{mm}-Full-A-A"]
+    ci_repro_aa = z_score * se_df[f"{mm}-Repro-A-A"]
+    ci_nonrepro_aa = z_score * se_df[f"{mm}-NonRepro-A-A"]
 
     x_values = grouped_df['CCC-Threshold']
 
@@ -186,7 +230,7 @@ def plot_auc(df, file_path, dataset):
 
     plt.xlim(max(x_values), min(x_values))
     plt.xlabel('CCC-Threshold')
-    plt.ylabel('AUC')
+    plt.ylabel(mm)
     plt.legend(ncol=1, loc='lower center')#, bbox_to_anchor=(0.5, 1.15))
     plt.text(0.02, 0.04, dataset, fontsize=20, transform=plt.gca().transAxes)
     plt.tight_layout()
@@ -222,7 +266,10 @@ def create_figure2(image_paths, output_path, margin=20):
 
 def main():
     root = "slices"
-    image_paths = []
+    image_paths = {}
+    for k in ["AUC", "Sensitivity", "Specificity", "AUPRC", "F1"]:
+        image_paths[k] = []
+
     for dataset in ["CRLM", "Desmoid", "GIST", "Lipo"]:
         if os.path.exists(f"./results/radiomics_results_{dataset}.xlsx"):
             df_radiomics = pd.read_excel(f"./results/radiomics_results_{dataset}.xlsx")
@@ -230,23 +277,27 @@ def main():
             print (f"Computing {dataset}")
             radiomics_results_all = []
             for ccc_threshold in np.arange(0.95, 0.65, -0.01):
-                radiomics_results = run_experiment("radiomics", f'{root}/{dataset}', num_repeats=100, ccc_threshold=ccc_threshold)
+            # for ccc_threshold in np.arange(0.65, 0.95, 0.01):
+                radiomics_results = run_experiment(f'{root}/{dataset}', num_repeats=num_repeats, ccc_threshold=ccc_threshold)
                 if ccc_threshold == 0.80:
                     radiomics_080 = radiomics_results.copy()
                 radiomics_results_all.extend(radiomics_results)
 
             df_radiomics = pd.DataFrame(radiomics_results_all)
             df_radiomics.to_excel(f"./results/radiomics_results_{dataset}.xlsx", index=False)
-        image_path = f"./results/radiomics_{dataset}.png"
-        plot_auc(df_radiomics, image_path, dataset)
-        image_paths.append(image_path)
 
-    create_figure2(image_paths, "./results/Figure_2.png", margin=20)
+        for k in ["AUC", "Sensitivity", "Specificity", "AUPRC", "F1"]:
+            image_path = f"./results/radiomics_{dataset}_{k}.png"
+            plot_metrics(df_radiomics, k, image_path, dataset)
+            image_paths[k].append(image_path)
+
+    for k in ["AUC", "Sensitivity", "Specificity", "AUPRC", "F1"]:
+        create_figure2(image_paths[k], f"./results/Figure_2_{k}.png", margin=20)
+
+    create_table()
 
 
 if __name__ == "__main__":
     main()
-
-
 
 #
